@@ -41,13 +41,6 @@ from vllm.v1.attention.backends.utils import AttentionCGSupport, CommonAttention
 from vllm_fl.dispatch.backends.vendor.ascend.impl.attention_mask import (
     AttentionMaskBuilder,
 )
-from vllm_fl.dispatch.backends.vendor.ascend.patches.patch_graph import (
-    get_draft_graph_params,
-    get_draft_graph_prefill_params,
-    get_graph_params,
-    update_draft_graph_params_workspaces,
-    update_graph_params_workspaces,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -328,8 +321,10 @@ class AscendAttentionMetadataBuilder:
         # Create attention mask based on state
         attn_mask = self._make_attention_mask(attn_state)
 
-        query_start_loc = query_start_loc_cpu.pin_memory().to(
-            self.device, non_blocking=True)
+        # Reuse the already-on-device query_start_loc (the synced device
+        # counterpart of the same CpuGpuBuffer as query_start_loc_cpu) instead
+        # of re-doing a per-forward H2D copy (vllm-ascend PR #11059).
+        query_start_loc = common_attn_metadata.query_start_loc[: num_reqs + 1]
 
         return AscendMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -568,33 +563,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 "npu_fused_infer_attention_score TND layout, falling back to "
                 "head-split attention (2x%d).", self.head_size,
                 self.head_size // 2)
-
-    @classmethod
-    def update_graph_params(
-        cls,
-        update_stream,
-        forward_context,
-        num_tokens: int,
-        vllm_config: VllmConfig,
-        speculative_config=None,
-        num_dcp_pcp_tokens=None,
-        draft_attn_metadatas=None,
-    ) -> None:
-        """Update graph parameters for ACL graph capture.
-
-        This is called by the model runner before graph replay to prepare
-        attention-specific workspaces and handles for the given capture size.
-        """
-        logger.debug(
-            "Updating graph params for AscendAttentionBackendImpl "
-            "num_tokens=%s", num_tokens)
-        # Workspace creation is backend-specific.  For the native torch_npu
-        # path the actual workspace is allocated lazily inside the attention
-        # kernels, so we only record the metadata here.
-        params = get_graph_params()
-        if params is not None and num_tokens in params.workspaces:
-            if params.workspaces[num_tokens] is None:
-                params.workspaces[num_tokens] = True  # marker
 
     def _get_fia_params(
         self,
@@ -1163,26 +1131,6 @@ class AscendMLABackendImpl(AttentionImpl):
         self.kv_cache_dtype = kv_cache_dtype
         self.sliding_window = sliding_window
         self.attn_type = attn_type
-
-    @classmethod
-    def update_graph_params(
-        cls,
-        update_stream,
-        forward_context,
-        num_tokens: int,
-        vllm_config: VllmConfig,
-        speculative_config=None,
-        num_dcp_pcp_tokens=None,
-        draft_attn_metadatas=None,
-    ) -> None:
-        """Update graph parameters for Ascend MLA ACL graph capture."""
-        logger.debug(
-            "Updating graph params for AscendMLABackendImpl num_tokens=%s",
-            num_tokens)
-        params = get_graph_params()
-        if params is not None and num_tokens in params.workspaces:
-            if params.workspaces[num_tokens] is None:
-                params.workspaces[num_tokens] = True  # marker
 
     def forward(
         self,

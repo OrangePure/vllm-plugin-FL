@@ -15,18 +15,14 @@ framework.
 
 from __future__ import annotations
 
-import dataclasses
 import logging
-import weakref
-from dataclasses import dataclass
-from typing import Any, ClassVar, Optional
+import os
+from typing import Any
 from unittest.mock import patch
 
 import torch
 
-from vllm.compilation.counter import compilation_counter
-from vllm.config import CUDAGraphMode, VllmConfig
-from vllm.forward_context import BatchDescriptor, get_forward_context
+from vllm.config import CUDAGraphMode
 from vllm.platforms import current_platform
 
 from vllm_fl.compilation.graph import register_graph_wrapper_backend
@@ -41,6 +37,17 @@ _STREAM_RESOURCE_ERROR_MARKERS = (
     "insufficient_stream_resources",
     "stream resources are insufficient",
 )
+
+
+def _skip_full_graph_replay_sync() -> bool:
+    """Skip the per-replay host-side full-stream drain in FULL graph mode
+    (vllm-ascend PR #11915 equivalent; see ``ACLGraphBackendMixin.before_replay``
+    for why FL does not need the device-side event machinery).
+
+    Default ON (skip the barrier): c64 A/B measured TPOT 103.27 -> 76.55 ms
+    (-26%) with no correctness impact. Set
+    ``VLLM_FL_SKIP_FULL_GRAPH_REPLAY_SYNC=0`` to restore the legacy barrier."""
+    return os.environ.get("VLLM_FL_SKIP_FULL_GRAPH_REPLAY_SYNC", "1") == "1"
 _STREAM_RESOURCE_GUIDANCE = (
     "ACL graph capture failed with a known stream-resource exhaustion "
     "signature. Consider upgrading to a newer HDK/CANN stack, reducing "
@@ -66,161 +73,8 @@ def _raise_stream_resource_capture_error(exc: RuntimeError) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Graph parameter bookkeeping for attention/MLA workspace reuse across captures
-# --------------------------------------------------------------------------- #
-@dataclass
-class GraphParams:
-    events: dict[int, list[torch.npu.ExternalEvent]]
-    workspaces: dict[int, torch.Tensor]
-    handles: dict[int, list[Any]]
-    attn_params: dict[int, list[tuple]]
-    conv1d_params: dict[int, list[tuple]]  # for causal conv1d params
-    conv1d_handles: dict[int, list[Any]]  # for causal conv1d params handles
-    conv1d_events: dict[int, list[torch.npu.ExternalEvent]]  # for causal conv1d params events
-
-
-_graph_params: Optional[GraphParams] = None
-_draft_graph_params: Optional[GraphParams] = None
-_draft_graph_prefill_params: Optional[GraphParams] = None
-
-
-def reset_graph_params() -> None:
-    global _graph_params, _draft_graph_params, _draft_graph_prefill_params
-    _graph_params = None
-    _draft_graph_params = None
-    _draft_graph_prefill_params = None
-
-
-def _make_empty_graph_params(capture_sizes: list[int]) -> GraphParams:
-    return GraphParams(
-        {size: [] for size in capture_sizes},
-        {size: None for size in capture_sizes},
-        {size: [] for size in capture_sizes},
-        {size: [] for size in capture_sizes},
-        {size: [] for size in capture_sizes},
-        {size: [] for size in capture_sizes},
-        {size: [] for size in capture_sizes},
-    )
-
-
-def set_graph_params(aclgraph_capture_sizes: list[int]) -> None:
-    global _graph_params
-    if _graph_params is not None:
-        raise ValueError("Graph parameters have already been set!")
-    _graph_params = _make_empty_graph_params(aclgraph_capture_sizes)
-
-
-def update_graph_params_workspaces(num_tokens: int, workspace: torch.Tensor) -> None:
-    global _graph_params
-    if _graph_params is not None:
-        _graph_params.workspaces[num_tokens] = workspace
-
-
-def get_graph_params() -> Optional[GraphParams]:
-    return _graph_params
-
-
-def set_draft_graph_params(aclgraph_capture_sizes: list[int]) -> None:
-    global _draft_graph_params
-    if _draft_graph_params is not None:
-        raise ValueError("DraftGraph parameters have already been set!")
-    _draft_graph_params = _make_empty_graph_params(aclgraph_capture_sizes)
-
-
-def update_draft_graph_params_workspaces(num_tokens: int, workspace: Any) -> None:
-    global _draft_graph_params
-    if _draft_graph_params is not None:
-        _draft_graph_params.workspaces[num_tokens] = workspace
-
-
-def get_draft_graph_params() -> Optional[GraphParams]:
-    return _draft_graph_params
-
-
-def set_draft_graph_prefill_params(aclgraph_capture_sizes: list[int]) -> None:
-    global _draft_graph_prefill_params
-    if _draft_graph_prefill_params is not None:
-        raise ValueError("DraftGraph prefill parameters have already been set!")
-    _draft_graph_prefill_params = _make_empty_graph_params(aclgraph_capture_sizes)
-
-
-def update_draft_graph_prefill_params_workspaces(num_tokens: int,
-                                                  workspace: Any) -> None:
-    global _draft_graph_prefill_params
-    if _draft_graph_prefill_params is not None:
-        _draft_graph_prefill_params.workspaces[num_tokens] = workspace
-
-
-def get_draft_graph_prefill_params() -> Optional[GraphParams]:
-    return _draft_graph_prefill_params
-
-
-def weak_ref_tensors(tensor: Any) -> Any:
-    """Convert tensors to weak references to save memory during graph replay."""
-    from vllm_fl.compilation.graph import weak_ref_tensors as _generic_weak_ref
-    return _generic_weak_ref(tensor)
-
-
-def weak_ref_workspaces(params: Optional[GraphParams]) -> None:
-    if params is None:
-        return
-    for num_tokens in params.workspaces:
-        if params.workspaces[num_tokens] is None:
-            continue
-        params.workspaces[num_tokens] = weak_ref_tensors(
-            params.workspaces[num_tokens])
-
-
-def update_full_graph_params(
-    attn_backend,
-    update_stream,
-    forward_context,
-    num_tokens: int,
-    vllm_config: VllmConfig,
-    speculative_config=None,
-    num_dcp_pcp_tokens: Optional[int] = None,
-    draft_attn_metadatas=None,
-) -> None:
-    """Dispatch graph-param updates to the attention backend and GDN conv1d."""
-    impl_cls = attn_backend.get_impl_cls()
-    if hasattr(impl_cls, "update_graph_params"):
-        impl_cls.update_graph_params(
-            update_stream,
-            forward_context,
-            num_tokens,
-            vllm_config,
-            speculative_config,
-            num_dcp_pcp_tokens,
-            draft_attn_metadatas,
-        )
-
-    # Optional GDN conv1d update (only available when vllm-ascend gdn is present).
-    try:
-        from vllm_ascend.ops.gdn import update_conv1d_graph_params
-        update_conv1d_graph_params(
-            update_stream,
-            forward_context,
-            num_tokens,
-            vllm_config,
-            getattr(forward_context, "is_draft_model", False),
-            draft_attn_metadatas,
-        )
-    except Exception:
-        pass
-
-
-# --------------------------------------------------------------------------- #
 # Ascend backend mixin for GraphWrapper
 # --------------------------------------------------------------------------- #
-@dataclasses.dataclass
-class _ACLGraphEntry:
-    """Internal entry used by the mixin; mirrors generic GraphEntry fields."""
-    batch_descriptor: BatchDescriptor
-    aclgraph: Any | None = None
-    output: Any | None = None
-    input_addresses: Optional[list[int]] = None
-
-
 class ACLGraphBackendMixin:
     """
     Backend-specific mixin that supplies Ascend ACL graph behavior to the
@@ -232,13 +86,6 @@ class ACLGraphBackendMixin:
     generic code path.
     """
 
-    _all_instances: ClassVar[weakref.WeakSet["ACLGraphBackendMixin"]] = weakref.WeakSet()
-
-    @classmethod
-    def clear_all_graphs(cls) -> None:
-        for instance in list(cls._all_instances):
-            instance.wrapper.concrete_graph_entries.clear()
-
     def __init__(self, wrapper):
         self.wrapper = wrapper
         self.vllm_config = wrapper.vllm_config
@@ -249,7 +96,6 @@ class ACLGraphBackendMixin:
         self.is_debugging_mode = wrapper.is_debugging_mode
         self._runnable_str = str(
             wrapper.runnable) if self.is_debugging_mode else None
-        ACLGraphBackendMixin._all_instances.add(self)
 
     def _is_stream_resource_capture_error(self, exc: RuntimeError) -> bool:
         return _is_stream_resource_capture_error(exc)
@@ -280,12 +126,6 @@ class ACLGraphBackendMixin:
 
     def after_capture(self, entry, output, args, kwargs) -> Any:
         self._join_offloader_after_forward()
-
-        # Convert attention workspace tensors to weak refs to save memory.
-        weak_ref_workspaces(get_graph_params())
-        weak_ref_workspaces(get_draft_graph_params())
-        weak_ref_workspaces(get_draft_graph_prefill_params())
-
         # The generic wrapper will weak-ref the output again; return the
         # original output so PyTorch can manage memory correctly during capture.
         return output
@@ -308,12 +148,50 @@ class ACLGraphBackendMixin:
 
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
         if not self.enable_enpu and need_sync:
+            if _skip_full_graph_replay_sync():
+                # FL has no vllm-ascend-style update_stream param-slot race
+                # (update_graph_params is unused dead code here): every input /
+                # metadata write before replay is issued on the current stream
+                # (stream-ordered with replay), and the reused pinned CPU
+                # buffers are protected by model_runner.synchronize_input_prep
+                # (prepare_inputs_event). The per-replay full-stream drain is
+                # therefore pure host-side overhead; skipping it lets the host
+                # run ahead into the next step (vllm-ascend PR #11915 achieves
+                # the same via device-side events, which FL does not need).
+                return
             torch.npu.current_stream().synchronize()
 
     def weak_ref_tensors(self, tensor: Any) -> Any:
-        # Ascend does not yet have a dedicated weak-ref csrc op; fall back to
-        # the generic implementation which currently returns the tensor as-is.
+        """Create weak references so the graph pool can reclaim capture-time
+        buffers once Python drops its strong refs (mirrors vllm-ascend
+        ``utils.weak_ref_tensors``). ``torch_npu._C._weak_ref_tensor`` is
+        available in the deployed torch_npu builds; fall back to identity
+        when it is missing."""
+        if isinstance(tensor, torch.Tensor):
+            return _weak_ref_tensor(tensor)
+        if isinstance(tensor, list):
+            return [self.weak_ref_tensors(t) for t in tensor]
+        if isinstance(tensor, tuple):
+            return tuple(self.weak_ref_tensors(t) for t in tensor)
         return tensor
+
+
+def _weak_ref_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    global _WEAK_REF_TENSOR_FN
+    if _WEAK_REF_TENSOR_FN is None:
+        try:
+            import torch_npu
+
+            _WEAK_REF_TENSOR_FN = torch_npu._C._weak_ref_tensor
+        except Exception:
+            logger.warning(
+                "torch_npu._C._weak_ref_tensor unavailable; graph-capture "
+                "buffers will be strongly held (identity fallback)")
+            _WEAK_REF_TENSOR_FN = lambda t: t
+    return _WEAK_REF_TENSOR_FN(tensor)
+
+
+_WEAK_REF_TENSOR_FN = None
 
 
 def patch_graph() -> None:
