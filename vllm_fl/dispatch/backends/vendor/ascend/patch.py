@@ -20,6 +20,10 @@ def apply_ascend_patches():
     patch_fused_moe()
     patch_qwen3_5_attention()
     patch_qwen3_6_gdn()
+    # NOTE: lm_head 权重预转置 NZ 暂时注释掉，用于单独手测 FlashComm 收益；
+    # 测完恢复下一行即可（或运行时用 VLLM_FL_DISABLE_LINEAR_NZ=1 临时关闭）。
+    # patch_linear_nz()
+    patch_flashcomm_v1()
     patch_qwen3_mtp()
     patch_graph()
     patch_npugraph_ex()
@@ -129,6 +133,53 @@ def patch_qwen3_6_gdn():
         _do_patch()
     except Exception as e:
         logger.warning("Failed to patch Qwen3.6 GDN AscendC ops: %s", e)
+
+
+def patch_linear_nz():
+    """Convert the ParallelLMHead weight to Ascend NZ layout at load time.
+
+    The vocab projection is by far the largest matmul in the model; NZ
+    removes its per-call transdata. Small/medium-N linears are deliberately
+    left in ND layout (NZ was measured neutral-to-negative there on 910B4).
+    ``VLLM_FL_DISABLE_LINEAR_NZ=1`` disables the conversion.
+    """
+    import os
+
+    if os.environ.get("VLLM_FL_DISABLE_LINEAR_NZ", "0") == "1":
+        logger.info("VLLM_FL_DISABLE_LINEAR_NZ=1, skip linear NZ conversion")
+        return
+    try:
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            UnquantizedEmbeddingMethod,
+        )
+
+        from .impl.linear_nz import convert_lm_head_weight_nz
+
+        orig_process_weights = UnquantizedEmbeddingMethod.process_weights_after_loading
+
+        def process_weights_after_loading_nz(self, layer):
+            orig_process_weights(self, layer)
+            # Only the logits projection; never touch embed_tokens
+            # (F.embedding must keep the ND layout).
+            if type(layer).__name__ == "ParallelLMHead":
+                convert_lm_head_weight_nz(layer)
+
+        UnquantizedEmbeddingMethod.process_weights_after_loading = (
+            process_weights_after_loading_nz
+        )
+        logger.info("Patched ParallelLMHead weight loading with NZ layout for Ascend")
+    except Exception as e:
+        logger.warning("Failed to patch linear NZ conversion: %s", e)
+
+
+def patch_flashcomm_v1():
+    """Apply FlashComm v1 (prefill TP communication fusion) for dense models."""
+    try:
+        from .patches.patch_flashcomm_v1 import patch_flashcomm_v1 as _do_patch
+
+        _do_patch()
+    except Exception as e:
+        logger.warning("Failed to patch FlashComm v1 for Ascend: %s", e)
 
 
 def patch_qwen3_mtp():
