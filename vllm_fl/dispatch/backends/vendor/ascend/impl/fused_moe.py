@@ -27,6 +27,11 @@ def ascendc_moe_available() -> bool:
     instruction address check error), so the grouped matmuls stay on
     ``torch_npu.npu_grouped_matmul``.  Set ``VLLM_FL_DISABLE_ASCENDC_MOE=1``
     to keep the FlagGems/torch_npu path.
+
+    Only ``moe_gating_top_k`` is still required from the custom package:
+    token routing uses the official ``torch_npu.npu_moe_init_routing_v2``
+    (aligned with upstream vllm-ascend PR #12305, which removed the custom
+    ``npu_moe_init_routing_custom`` op).
     """
     global _ASCENDC_MOE_AVAILABLE
     if _ASCENDC_MOE_AVAILABLE is not None:
@@ -47,7 +52,7 @@ def ascendc_moe_available() -> bool:
         return False
     missing = [
         name
-        for name in ("moe_gating_top_k", "npu_moe_init_routing_custom")
+        for name in ("moe_gating_top_k",)
         if not hasattr(torch.ops._C_ascend, name)
     ]
     if missing:
@@ -133,8 +138,10 @@ def _ascendc_fused_experts_impl(
     """AscendC fused MoE experts implementation.
 
     Same structure as ``_torch_fused_experts_impl`` but the token
-    routing/permute runs on the AscendC ``npu_moe_init_routing_custom``
-    kernel and the weights are pre-transposed (see
+    routing/permute runs on the official ``torch_npu.npu_moe_init_routing_v2``
+    with ``row_idx_type=0`` (replacing the removed AscendC
+    ``npu_moe_init_routing_custom``, aligned with upstream vllm-ascend PR
+    #12305) and the weights are pre-transposed (see
     ``convert_moe_weights_pretransposed``), so the grouped matmuls consume
     them directly:
 
@@ -164,9 +171,11 @@ def _ascendc_fused_experts_impl(
 
     # Expand tokens according to top-k expert assignment and sort them by
     # expert.  expanded_row_idx maps each sorted row back to the original
-    # flat (token*topk + k) position (row_idx_type=0).
+    # flat (token*topk + k) position (row_idx_type=0).  Uses the official
+    # torch_npu op (the AscendC npu_moe_init_routing_custom was removed,
+    # aligned with upstream vllm-ascend PR #12305).
     expanded_x, expanded_row_idx, expert_token_count, _ = (
-        torch.ops._C_ascend.npu_moe_init_routing_custom(
+        torch_npu.npu_moe_init_routing_v2(
             hidden_states,
             local_topk_ids.to(torch.int32),
             active_num=num_tokens * top_k,

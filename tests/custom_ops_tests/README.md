@@ -9,7 +9,7 @@
 ### 1.1 CANN Framework 算子（aclnn 路径）
 
 - **源码位置**：`csrc/ascend/<category>/<op_name>/`
-  - 例如 `csrc/ascend/moe/causal_conv1d/`、`csrc/ascend/attention/fused_gdn_gating/`。
+  - 例如 `csrc/ascend/moe/causal_conv1d/`、`csrc/ascend/attention/sparse_flash_attention/`。
 - **构建工具链**：CANN `op_host` / `op_kernel` / `aclnn` 工具链。
 - **产物**：自解压 `.run` 算子包，例如 `csrc/ascend/build/cann-ops-transformer-custom_linux-aarch64.run`。
 - **安装位置**：默认隔离安装到项目目录 `vllm_fl/_cann_ops_custom/vendors/custom_transformer/`，不污染系统 CANN。
@@ -220,7 +220,6 @@ csrc/ascend/
 ```bash
 # CANN framework 算子
 python tests/custom_ops_tests/test_causal_conv1d.py
-python tests/custom_ops_tests/test_fused_gdn_gating.py
 python tests/custom_ops_tests/test_gemma_rms_norm.py
 python tests/custom_ops_tests/test_recurrent_gated_delta_rule.py
 python tests/custom_ops_tests/test_chunk_gated_delta_rule_fwd_h.py
@@ -252,7 +251,6 @@ done
 | 测试脚本 | 对应算子 | 接入方式 |
 |---|---|---|
 | `test_causal_conv1d.py` | `npu_causal_conv1d_custom` | CANN framework |
-| `test_fused_gdn_gating.py` | `npu_fused_gdn_gating` | CANN framework |
 | `test_gemma_rms_norm.py` | `npu_gemma_rms_norm` | CANN framework |
 | `test_recurrent_gated_delta_rule.py` | `npu_recurrent_gated_delta_rule` | CANN framework |
 | `test_chunk_gated_delta_rule_fwd_h.py` | `chunk_gated_delta_rule_fwd_h` | CANN framework |

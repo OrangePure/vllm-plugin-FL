@@ -89,7 +89,6 @@ if(VLLM_VENDOR STREQUAL "ascend")
         ascend/aclnn_torch_adapter/NPUStorageImpl.h
         # Framework operator torch adapters (op_host/op_kernel/ are built by the
         # CANN toolchain and are present here for reference / vendor packaging).
-        ascend/attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h
         ascend/attention/kv_quant_sparse_flash_attention/kv_quant_sparse_flash_attention_torch_adpt.h
         ascend/attention/lightning_indexer/lightning_indexer_torch_adpt.h
         ascend/attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h
@@ -105,7 +104,6 @@ if(VLLM_VENDOR STREQUAL "ascend")
         ascend/moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h
         ascend/moe/apply_top_k_top_p_custom/apply_top_k_top_p_custom_torch_adpt.h
         ascend/moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h
-        ascend/moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h
     )
 
     file(GLOB VLLM_FL_ASCEND_KERNELS ascend/kernels/*.cpp)

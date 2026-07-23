@@ -3,7 +3,6 @@
 #
 # Correctness test for the AscendC fused-MoE custom ops used by the FL MoE path:
 #   * torch.ops._C_ascend.moe_gating_top_k          (fused router: softmax + topk + renorm)
-#   * torch.ops._C_ascend.npu_moe_init_routing_custom  (token expand/sort by expert)
 #
 # plus an end-to-end parity check of the new `_ascendc_fused_experts_impl`
 # (custom routing + pre-transposed weights) against the legacy

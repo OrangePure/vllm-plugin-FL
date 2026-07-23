@@ -24,7 +24,9 @@ FL plugin on vLLM 0.13:
 
 * ``npu_causal_conv1d_custom`` replaces the Triton ``causal_conv1d_fn`` /
   ``causal_conv1d_update`` calls inside ``Qwen3NextGatedDeltaNet._forward_core``.
-* ``npu_fused_gdn_gating`` replaces the Triton ``fused_gdn_gating``.
+* Gating (``g``/``beta``) uses the Triton ``fused_gdn_gating_patch``
+  (``impl/fused_gdn_gating.py``), aligned with upstream vllm-ascend which
+  removed the AscendC ``npu_fused_gdn_gating`` op (PR #12035).
 * ``npu_recurrent_gated_delta_rule`` replaces ``fused_recurrent_gated_delta_rule``
   on the (speculative-)decode paths.  The chunked prefill path keeps the
   existing Triton ``chunk_gated_delta_rule`` (already patched to the Ascend
@@ -87,13 +89,13 @@ from vllm.v1.kv_cache_interface import MambaSpec
 import vllm.model_executor.models.qwen3_next as _qwen3_next_lib
 
 from ..impl.fla.l2norm import l2norm_fwd
+from ..impl.fused_gdn_gating import fused_gdn_gating_patch
 
 logger = logging.getLogger(__name__)
 
 _CUSTOM_OPP_MARKER = "custom_transformer"
 _REQUIRED_OPS = (
     "npu_causal_conv1d_custom",
-    "npu_fused_gdn_gating",
     "npu_recurrent_gated_delta_rule",
     "npu_gemma_rms_norm",
     "npu_add_rms_norm_bias",
@@ -486,9 +488,10 @@ class AscendCGatedDeltaNet(Qwen3NextGatedDeltaNet):
         )
 
         # 2. Recurrent attention
-        g, beta = torch.ops._C_ascend.npu_fused_gdn_gating(
-            self.A_log, a, b, self.dt_bias.to(self.A_log.dtype)
-        )
+        # Triton gating (aligned with upstream vllm-ascend after the AscendC
+        # npu_fused_gdn_gating op was removed); dt_bias is upcast to fp32
+        # inside the kernel.
+        g, beta = fused_gdn_gating_patch(self.A_log, a, b, self.dt_bias)
 
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
@@ -649,8 +652,8 @@ def patch_qwen3_6_gdn() -> bool:
         _patch_gdn_metadata_host_flags()
     logger.info(
         "Patched Qwen3NextGatedDeltaNet and GemmaRMSNorm for Ascend "
-        "(AscendC causal_conv1d / fused_gdn_gating / recurrent_gated_delta_rule "
-        "/ gemma_rms_norm, PTO megakernel for fresh prefill: %s)",
+        "(AscendC causal_conv1d / recurrent_gated_delta_rule / gemma_rms_norm, "
+        "Triton fused_gdn_gating, PTO megakernel for fresh prefill: %s)",
         "on" if _pto_available() else "off",
     )
     return True

@@ -41,14 +41,12 @@
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
 #include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
-#include "moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "attention/kv_quant_sparse_flash_attention/kv_quant_sparse_flash_attention_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "attention/ngram_spec_decode/ngram_spec_decode_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/store_kv_block/store_kv_block_torch_adpt.h"
-#include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -2324,13 +2322,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         str groupTp, int tpRankSize, int tpRankId, float epsilon, bool isTransB, bool isGatherAddOut) -> (Tensor output, Tensor add_out)");
     ops.impl("matmul_allreduce_add_rmsnorm", torch::kPrivateUse1, &vllm_fl::matmul_allreduce_add_rmsnorm);
 
-    ops.def(
-        "npu_moe_init_routing_custom(Tensor x, Tensor expert_idx, *, Tensor? scale=None, Tensor? offset=None, int active_num=-1, "
-        "                            int expert_capacity=-1, int expert_num=-1, int drop_pad_mode=0, int expert_tokens_num_type=0, "
-        "                            bool expert_tokens_num_flag=False, int quant_mode=0, int[2] active_expert_range=[], "
-        "                            int row_idx_type=0) -> (Tensor, Tensor, Tensor, Tensor)"
-    );
-    ops.impl("npu_moe_init_routing_custom", torch::kPrivateUse1, &vllm_fl::npu_moe_init_routing_custom);
     // vLLM-Ascend custom ops
     ops.def(
         "moe_gating_top_k(Tensor x, "
@@ -2683,15 +2674,5 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "store_kv_block(Tensor key_in, Tensor key_cache_in, Tensor group_len, Tensor group_key_idx,Tensor group_key_cache_idx, int block_size=0) -> ()"
     );
     ops.impl("store_kv_block", torch::kPrivateUse1, &vllm_fl::store_kv_block);
-    
-    // Fused GDN gating.
-    ops.def(
-        "npu_fused_gdn_gating(Tensor A_log, "
-        "                     Tensor a, "
-        "                     Tensor b, "
-        "                     Tensor dt_bias, "
-        "                     float beta=1.0, "
-        "                     float threshold=20.0) -> (Tensor g, Tensor beta_output)");
-    ops.impl("npu_fused_gdn_gating", torch::kPrivateUse1, &vllm_fl::npu_fused_gdn_gating);
 }
 #endif
