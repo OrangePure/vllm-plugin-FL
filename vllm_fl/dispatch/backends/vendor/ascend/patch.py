@@ -27,6 +27,7 @@ def apply_ascend_patches():
     patch_qwen3_mtp()
     patch_graph()
     patch_npugraph_ex()
+    patch_static_kernel()
     patch_dynamo_safe_ops()
 
 def patch_mamba_config():
@@ -210,6 +211,16 @@ def patch_npugraph_ex():
         _do_patch()
     except Exception as e:
         logger.warning("Failed to patch npugraph_ex for Ascend: %s", e)
+
+
+def patch_static_kernel():
+    """Register the static-kernel uninstall hook (enable_static_kernel port)."""
+    try:
+        from .patches.patch_static_kernel import patch_static_kernel as _do_patch
+
+        _do_patch()
+    except Exception as e:
+        logger.warning("Failed to patch static kernel for Ascend: %s", e)
 
 
 def patch_fla_ops():
