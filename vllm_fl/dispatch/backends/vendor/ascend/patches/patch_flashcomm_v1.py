@@ -34,9 +34,12 @@ Ports the vllm-ascend FlashComm v1 design (``vllm_ascend/ops/linear_op.py``
 
 Activation mirrors vllm-ascend: dense models, TP > 1, PP == 1, and
 ``num_tokens > 1000`` — i.e. prefill / long chunked-prefill batches only;
-decode steps and small batches take the standard path, so the flash flow
-never runs inside captured decode graphs. Set ``VLLM_FL_FLASHCOMM=0`` to
-disable. MoE (sparse) MLP blocks are not covered yet and keep the standard
+decode steps and small batches take the standard path. The decision is made
+once per model forward (``_FLASH_STATE``) and additionally suppressed for
+embeds-based dummy runs (input_ids=None) and inside dynamo-traced or
+graph-captured forwards (``_flash_forbidden_context``), so the flash
+collectives never enter traced/captured graphs. Set ``VLLM_FL_FLASHCOMM=0``
+to disable. MoE (sparse) MLP blocks are not covered yet and keep the standard
 path.
 """
 
@@ -93,6 +96,27 @@ def flash_state_active() -> bool:
     """Per-forward activation flag set by the model wrapper (single
     decision point for all patched components)."""
     return _FLASH_STATE["active"]
+
+
+def _should_manage_flash(input_ids) -> bool:
+    """True only for eager forwards with real token ids. Under dynamo
+    tracing or stream capture the flash management must be invisible: a
+    global-state mutation (``_FLASH_STATE`` write) inside the compiled region
+    is rejected by dynamo's cudagraph-safety check, and HCCL collectives must
+    never be baked into captured graphs. vllm-ascend makes the collectives
+    graph-safe by wrapping them in custom ops; FL keeps FlashComm eager-only
+    instead (decode graph capture sizes are far below the token threshold
+    anyway, so nothing is lost)."""
+    if torch.compiler.is_compiling():
+        return False
+    try:
+        if torch.npu.is_current_stream_capturing():
+            return False
+    except Exception:
+        pass
+    # Dummy runs for graph capture / memory profiling pass inputs_embeds
+    # with input_ids=None; they must stay on the standard path.
+    return isinstance(input_ids, torch.Tensor)
 
 
 def _hccl_name() -> str:
@@ -292,15 +316,17 @@ def _qwen3next_model_forward(
     intermediate_tensors=None,
     inputs_embeds=None,
 ):
-    # Single activation decision for the whole forward pass: computed from
-    # the real input token count and consumed by every patched component
-    # via ``_FLASH_STATE`` (see the comment there).
-    if isinstance(input_ids, torch.Tensor):
-        num_tokens = input_ids.shape[0]
-    elif isinstance(inputs_embeds, torch.Tensor):
-        num_tokens = inputs_embeds.shape[0]
-    else:
-        num_tokens = 0
+    # When flash management is skipped (dynamo tracing / stream capture /
+    # embeds-based dummy runs), return the plain original forward so nothing
+    # flash-related — in particular the ``_FLASH_STATE`` global write — is
+    # ever seen by the tracer/capturer (dynamo cudagraph-safety check).
+    if not _should_manage_flash(input_ids):
+        return _QWEN3NEXT_MODEL_FORWARD(
+            self, input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+    # Eager forward with real token ids: single activation decision for the
+    # whole pass, consumed by every patched component via ``_FLASH_STATE``.
+    num_tokens = input_ids.shape[0]
     active = (
         num_tokens > 0
         and flashcomm_active(num_tokens)
