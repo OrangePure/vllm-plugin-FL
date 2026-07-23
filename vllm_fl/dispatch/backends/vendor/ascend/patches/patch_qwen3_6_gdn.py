@@ -24,9 +24,12 @@ FL plugin on vLLM 0.13:
 
 * ``npu_causal_conv1d_custom`` replaces the Triton ``causal_conv1d_fn`` /
   ``causal_conv1d_update`` calls inside ``Qwen3NextGatedDeltaNet._forward_core``.
-* Gating (``g``/``beta``) uses the Triton ``fused_gdn_gating_patch``
-  (``impl/fused_gdn_gating.py``), aligned with upstream vllm-ascend which
-  removed the AscendC ``npu_fused_gdn_gating`` op (PR #12035).
+* Gating (``g``/``beta``) is dispatched by ``_gdn_gating``: the AscendC
+  ``npu_fused_gdn_gating`` op by default, or the Triton
+  ``fused_gdn_gating_patch`` (``impl/fused_gdn_gating.py``, aligned with
+  upstream vllm-ascend PR #12035) when ``VLLM_FL_GDN_GATING_IMPL=triton``
+  or the op is unavailable. The AscendC path is the default because the
+  Triton path measured ~10x slower in graph-mode decode on 910B4.
 * ``npu_recurrent_gated_delta_rule`` replaces ``fused_recurrent_gated_delta_rule``
   on the (speculative-)decode paths.  The chunked prefill path keeps the
   existing Triton ``chunk_gated_delta_rule`` (already patched to the Ascend
@@ -92,6 +95,34 @@ from ..impl.fla.l2norm import l2norm_fwd
 from ..impl.fused_gdn_gating import fused_gdn_gating_patch
 
 logger = logging.getLogger(__name__)
+
+_GDN_GATING_FN = None
+
+
+def _gdn_gating(A_log, a, b, dt_bias):
+    """Gating (g/beta) dispatch: AscendC fused op by default, Triton fallback.
+
+    ``VLLM_FL_GDN_GATING_IMPL`` = ``ascendc`` (default) | ``triton``.
+    Commit 116150d removed the AscendC op from the csrc sources, but it is
+    still registered in the deployed extension build; the Triton path was
+    measured catastrophically slower in graph-mode decode on 910B4
+    (bs1 TPOT ~28ms -> ~319ms, c64 ~70ms -> ~103ms), so the AscendC path
+    stays the default while the op is available."""
+    global _GDN_GATING_FN
+    if _GDN_GATING_FN is None:
+        impl = os.environ.get("VLLM_FL_GDN_GATING_IMPL", "ascendc").lower()
+        if impl == "ascendc" and hasattr(torch.ops._C_ascend, "npu_fused_gdn_gating"):
+
+            def _ascendc_gating(A_log, a, b, dt_bias):
+                return torch.ops._C_ascend.npu_fused_gdn_gating(
+                    A_log, a, b, dt_bias.to(A_log.dtype))
+
+            _GDN_GATING_FN = _ascendc_gating
+            logger.info("GDN gating: AscendC npu_fused_gdn_gating")
+        else:
+            _GDN_GATING_FN = fused_gdn_gating_patch
+            logger.info("GDN gating: Triton fused_gdn_gating_patch (impl=%s)", impl)
+    return _GDN_GATING_FN(A_log, a, b, dt_bias)
 
 _CUSTOM_OPP_MARKER = "custom_transformer"
 _REQUIRED_OPS = (
@@ -488,10 +519,10 @@ class AscendCGatedDeltaNet(Qwen3NextGatedDeltaNet):
         )
 
         # 2. Recurrent attention
-        # Triton gating (aligned with upstream vllm-ascend after the AscendC
-        # npu_fused_gdn_gating op was removed); dt_bias is upcast to fp32
-        # inside the kernel.
-        g, beta = fused_gdn_gating_patch(self.A_log, a, b, self.dt_bias)
+        # Gating via _gdn_gating dispatch: AscendC npu_fused_gdn_gating by
+        # default (see its docstring), Triton fused_gdn_gating_patch on
+        # request (VLLM_FL_GDN_GATING_IMPL=triton) or when the op is missing.
+        g, beta = _gdn_gating(self.A_log, a, b, self.dt_bias)
 
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
@@ -653,7 +684,8 @@ def patch_qwen3_6_gdn() -> bool:
     logger.info(
         "Patched Qwen3NextGatedDeltaNet and GemmaRMSNorm for Ascend "
         "(AscendC causal_conv1d / recurrent_gated_delta_rule / gemma_rms_norm, "
-        "Triton fused_gdn_gating, PTO megakernel for fresh prefill: %s)",
+        "gating dispatch (VLLM_FL_GDN_GATING_IMPL, default ascendc), "
+        "PTO megakernel for fresh prefill: %s)",
         "on" if _pto_available() else "off",
     )
     return True

@@ -682,6 +682,27 @@ std::vector<at::Tensor> moe_grouped_matmul_meta(
     return y;
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_fused_gdn_gating_meta(
+    const at::Tensor& A_log,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    const at::Tensor& dt_bias,
+    double beta,
+    double threshold)
+{
+    (void)beta;
+    (void)threshold;
+    auto batch = a.sym_size(0);
+    auto num_heads = a.sym_size(1);
+
+    at::Tensor g = at::empty_symint(
+        c10::SymDimVector{c10::SymInt(1), batch, num_heads}, a.options().dtype(c10::kFloat));
+    at::Tensor beta_output = at::empty_symint(
+        c10::SymDimVector{c10::SymInt(1), batch, num_heads}, b.options());
+
+    return std::make_tuple(g, beta_output);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_gating_top_k_hash_meta(
     const at::Tensor& x,
     int64_t k,
@@ -1651,6 +1672,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     // moe_grouped_matmul
     ops.impl("moe_grouped_matmul", &vllm_fl::meta::moe_grouped_matmul_meta);
     ops.impl("moe_gating_top_k_hash", &vllm_fl::meta::moe_gating_top_k_hash_meta);
+    // npu_fused_gdn_gating
+    ops.impl("npu_fused_gdn_gating", &vllm_fl::meta::npu_fused_gdn_gating_meta);
     ops.impl("compressor", &vllm_fl::meta::compressor_meta);
     ops.impl("compressor_metadata", &vllm_fl::meta::compressor_metadata_meta);
     ops.impl("npu_vllm_quant_lightning_indexer", &vllm_fl::meta::npu_vllm_quant_lightning_indexer_meta);
